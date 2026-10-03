@@ -1,720 +1,877 @@
-"""
-Binance Spot Accumulation + 1H Volume Expansion + Catalyst Radar
-Streamlit Cloud version.
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-Uses Binance's public market-data host:
-https://data-api.binance.vision
-This host is documented by Binance for public market-data endpoints,
-including exchangeInfo, klines and ticker/24hr.
-
-Radar only — no automatic trading and no guaranteed signal.
-"""
-
-import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
-import feedparser
-import re
-import time
-from datetime import datetime, timezone
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import streamlit as st
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+BINANCE_BASE = "https://api.binance.com"
+
+INTERVAL_4H = "4h"
+INTERVAL_1H = "1h"
+
+# 4H structure settings
+LOOKBACK_4H = 30
+RANGE_LOOKBACK = 12
+
+# 1H volume settings
+VOLUME_LOOKBACK_1H = 10
+
+# User-defined thresholds
+VOLUME_EXPANSION = 1.5
+STRONG_EXPANSION = 3.0
+
+# Resistance proximity
+RESISTANCE_LOOKBACK = 30
+RESISTANCE_DISTANCE_PCT = 3.0
+
+# Scanner performance
+MAX_WORKERS = 8
+
+REQUEST_TIMEOUT = 15
+
+
+# ============================================================
+# PAGE
+# ============================================================
 
 st.set_page_config(
-    page_title="Binance Spot Radar",
-    page_icon="📡",
+    page_title="Binance USDT Accumulation Scanner",
+    page_icon="📊",
     layout="wide",
 )
 
-# Binance explicitly documents data-api.binance.vision for public market data.
-BASE_URLS = [
-    "https://data-api.binance.vision",
-    "https://api-gcp.binance.com",
-    "https://api1.binance.com",
-    "https://api2.binance.com",
-    "https://api3.binance.com",
-    "https://api4.binance.com",
-]
-TIMEOUT = 8
-SESSION = requests.Session()
-SESSION.headers.update({
-    "User-Agent": "Mozilla/5.0 Binance-Spot-Radar/1.0"
-})
-
-STABLES = {
-    "USDCUSDT", "FDUSDUSDT", "TUSDUSDT", "USDPUSDT",
-    "BUSDUSDT", "DAIUSDT", "EURUSDT", "TRYUSDT"
-}
+st.title("📊 Binance Spot USDT Accumulation Scanner")
+st.caption(
+    "4H accumulation + tight range + volume analysis + 1H volume expansion + resistance proximity"
+)
 
 
-def api_get(path, params=None, attempts=2):
-    """Try Binance public market-data hosts until one responds successfully."""
-    last_error = None
+# ============================================================
+# HELPERS
+# ============================================================
 
-    for base in BASE_URLS:
-        for attempt in range(attempts):
-            try:
-                r = SESSION.get(
-                    base + path,
-                    params=params or {},
-                    timeout=TIMEOUT,
-                )
-
-                if r.status_code == 200:
-                    return r.json(), base
-
-                # 451/403/429 are host-specific access/rate issues.
-                # Move to the next host instead of killing the app.
-                last_error = f"{base} -> HTTP {r.status_code}: {r.text[:180]}"
-
-                if r.status_code in (403, 418, 429, 451):
-                    break
-
-            except requests.RequestException as e:
-                last_error = f"{base} -> {e}"
-
-            if attempt + 1 < attempts:
-                time.sleep(0.25)
-
-    raise RuntimeError(last_error or "All Binance market-data endpoints failed.")
+session = requests.Session()
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def get_exchange_info():
-    data, base = api_get("/api/v3/exchangeInfo")
-    return data, base
+@st.cache_data(ttl=300)
+def get_usdt_symbols():
+    """Get Binance Spot USDT symbols."""
+    url = f"{BINANCE_BASE}/api/v3/exchangeInfo"
 
+    r = session.get(url, timeout=REQUEST_TIMEOUT)
+    r.raise_for_status()
 
-@st.cache_data(ttl=30, show_spinner=False)
-def get_24h_tickers():
-    data, base = api_get("/api/v3/ticker/24hr")
-    return data, base
+    data = r.json()
 
-
-def get_spot_usdt_symbols():
-    data, _ = get_exchange_info()
     symbols = []
 
-    for s in data.get("symbols", []):
+    for s in data["symbols"]:
         if (
-            s.get("status") == "TRADING"
-            and s.get("quoteAsset") == "USDT"
-            and s.get("isSpotTradingAllowed", True)
-            and s.get("symbol") not in STABLES
+            s["status"] == "TRADING"
+            and s["quoteAsset"] == "USDT"
+            and s["isSpotTradingAllowed"]
         ):
             symbols.append(s["symbol"])
 
     return symbols
 
 
-def get_klines(symbol, interval, limit=80):
-    try:
-        data, _ = api_get(
-            "/api/v3/klines",
-            {"symbol": symbol, "interval": interval, "limit": limit},
-            attempts=1,
-        )
+@st.cache_data(ttl=60)
+def get_klines(symbol, interval, limit):
+    """Get Binance OHLCV candles."""
+    url = f"{BINANCE_BASE}/api/v3/klines"
 
-        if not isinstance(data, list) or len(data) < 25:
-            return None
-
-        cols = [
-            "open_time", "open", "high", "low", "close", "volume",
-            "close_time", "quote_volume", "trades", "taker_base",
-            "taker_quote", "ignore"
-        ]
-
-        df = pd.DataFrame(data, columns=cols)
-
-        for c in [
-            "open", "high", "low", "close",
-            "volume", "quote_volume", "taker_base", "taker_quote"
-        ]:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-
-        return df
-
-    except Exception:
-        return None
-
-
-def pct(new, old):
-    if old == 0 or pd.isna(old):
-        return 0.0
-    return (new / old - 1.0) * 100.0
-
-
-def accumulation_score(df):
-    """
-    Transparent heuristic for a quiet/compressed 4H base.
-
-    It does NOT prove accumulation. It ranks structures for manual review.
-    """
-    if df is None or len(df) < 50:
-        return None
-
-    # Exclude the currently-forming candle.
-    d = df.iloc[:-1].copy()
-
-    recent = d.tail(24)  # ~4 days
-    base = d.tail(48)    # ~8 days
-
-    hi = recent["high"].max()
-    lo = recent["low"].min()
-    last = recent["close"].iloc[-1]
-
-    range_pct = (hi - lo) / max(lo, 1e-12) * 100
-    range_score = float(np.clip(100 - max(range_pct - 8, 0) * 7, 0, 100))
-
-    returns = recent["close"].pct_change().dropna()
-    down = returns[returns < 0]
-    up = returns[returns > 0]
-
-    down_vol = down.std() if len(down) else 0.0
-    up_vol = up.std() if len(up) else 0.0001
-    volatility_score = float(
-        np.clip(100 - (down_vol / max(up_vol, 1e-6)) * 45, 0, 100)
-    )
-
-    position = (last - lo) / max(hi - lo, 1e-12)
-    hold_score = float(np.clip(position * 120, 0, 100))
-
-    vr = recent["quote_volume"].mean() / max(base["quote_volume"].mean(), 1e-12)
-    volume_score = float(
-        np.clip(100 - abs(vr - 0.9) * 100, 0, 100)
-    )
-
-    clv = (
-        ((d["close"] - d["low"]) - (d["high"] - d["close"]))
-        / (d["high"] - d["low"]).replace(0, np.nan)
-    ).fillna(0)
-
-    mf = (clv * d["quote_volume"]).tail(24).sum()
-    mf_score = float(np.clip(
-        50 + mf / max(recent["quote_volume"].sum(), 1e-12) * 50,
-        0, 100
-    ))
-
-    score = (
-        range_score * 0.28
-        + volatility_score * 0.17
-        + hold_score * 0.20
-        + volume_score * 0.15
-        + mf_score * 0.20
-    )
-
-    return {
-        "acc_score": round(score, 1),
-        "range_pct": round(float(range_pct), 2),
-        "4h_vol_ratio": round(float(vr), 2),
-        "range_position": round(float(position * 100), 1),
+    params = {
+        "symbol": symbol,
+        "interval": interval,
+        "limit": limit,
     }
 
+    r = session.get(
+        url,
+        params=params,
+        timeout=REQUEST_TIMEOUT,
+    )
 
-def volume_expansion(df):
+    r.raise_for_status()
+
+    data = r.json()
+
+    if not data:
+        return pd.DataFrame()
+
+    columns = [
+        "open_time",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "close_time",
+        "quote_volume",
+        "trades",
+        "taker_buy_base",
+        "taker_buy_quote",
+        "ignore",
+    ]
+
+    df = pd.DataFrame(data, columns=columns)
+
+    numeric_cols = [
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "quote_volume",
+        "trades",
+        "taker_buy_base",
+        "taker_buy_quote",
+    ]
+
+    for col in numeric_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df["open_time"] = pd.to_datetime(
+        df["open_time"],
+        unit="ms",
+        utc=True,
+    )
+
+    df["close_time"] = pd.to_datetime(
+        df["close_time"],
+        unit="ms",
+        utc=True,
+    )
+
+    return df
+
+
+def safe_pct(a, b):
+    if b == 0 or pd.isna(b):
+        return np.nan
+
+    return ((a - b) / b) * 100
+
+
+# ============================================================
+# 4H ACCUMULATION
+# ============================================================
+
+def detect_accumulation(df):
     """
-    Latest COMPLETED 1H candle vs previous 20 completed 1H candles.
+    Heuristic accumulation detector.
+
+    Conditions:
+    1. Recent range relatively tight.
+    2. Price remains above the range low.
+    3. Lower volatility than earlier period.
+    4. No major breakdown.
+    5. Recent closes are not aggressively trending down.
     """
-    if df is None or len(df) < 25:
-        return None
 
-    d = df.iloc[:-1].copy()
+    if len(df) < LOOKBACK_4H:
+        return False, {}
 
-    current = d.iloc[-1]
-    baseline = d["quote_volume"].iloc[-21:-1]
+    d = df.tail(LOOKBACK_4H).copy()
 
-    avg_volume = baseline.mean()
+    recent = d.tail(RANGE_LOOKBACK)
+
+    range_high = recent["high"].max()
+    range_low = recent["low"].min()
+
+    if range_low <= 0:
+        return False, {}
+
+    range_pct = ((range_high - range_low) / range_low) * 100
+
+    # Volatility comparison
+    d["returns"] = d["close"].pct_change()
+
+    old_vol = d["returns"].head(15).std()
+    recent_vol = d["returns"].tail(12).std()
+
+    volatility_contracting = (
+        not pd.isna(old_vol)
+        and not pd.isna(recent_vol)
+        and recent_vol <= old_vol * 1.15
+    )
+
+    # Recent price location
+    current_price = d["close"].iloc[-1]
+
+    location_in_range = (
+        (current_price - range_low)
+        / (range_high - range_low)
+        if range_high != range_low
+        else 0.5
+    )
+
+    # Avoid obvious breakdown
+    recent_closes = recent["close"]
+
+    breakdown = (
+        recent_closes.iloc[-1] < range_low * 0.985
+    )
+
+    # Basic downward trend check
+    first_close = recent_closes.iloc[0]
+    last_close = recent_closes.iloc[-1]
+
+    trend_change = (
+        ((last_close - first_close) / first_close) * 100
+        if first_close != 0
+        else 0
+    )
+
+    not_strong_downtrend = trend_change > -8
+
+    # Volume behavior
+    old_volume = d["volume"].head(15).mean()
+    recent_volume = d["volume"].tail(10).mean()
+
+    volume_ratio = (
+        recent_volume / old_volume
+        if old_volume > 0
+        else np.nan
+    )
+
+    volume_stable_or_increasing = (
+        not pd.isna(volume_ratio)
+        and volume_ratio >= 0.80
+    )
+
+    # Tight-range condition
+    tight_range = range_pct <= 12
+
+    accumulation = (
+        tight_range
+        and volatility_contracting
+        and not breakdown
+        and not_strong_downtrend
+        and volume_stable_or_increasing
+    )
+
+    details = {
+        "range_pct": range_pct,
+        "location_in_range": location_in_range * 100,
+        "old_volume": old_volume,
+        "recent_volume": recent_volume,
+        "volume_ratio": volume_ratio,
+        "volatility_contracting": volatility_contracting,
+        "volume_stable": volume_stable_or_increasing,
+        "tight_range": tight_range,
+    }
+
+    return accumulation, details
+
+
+# ============================================================
+# 4H VOLUME
+# ============================================================
+
+def analyze_4h_volume(df):
+    if len(df) < 20:
+        return False, np.nan
+
+    recent = df["volume"].tail(8).mean()
+    previous = df["volume"].iloc[-16:-8].mean()
+
+    if previous <= 0:
+        return False, np.nan
+
+    ratio = recent / previous
+
+    stable_or_increasing = ratio >= 0.80
+
+    return stable_or_increasing, ratio
+
+
+# ============================================================
+# 1H VOLUME EXPANSION
+# ============================================================
+
+def analyze_1h_volume(df):
+    """
+    Current 1H volume / previous 10-candle average volume.
+    """
+
+    if len(df) < VOLUME_LOOKBACK_1H + 1:
+        return np.nan, "Insufficient Data"
+
+    current_volume = df["volume"].iloc[-1]
+
+    previous_10 = df["volume"].iloc[
+        -(VOLUME_LOOKBACK_1H + 1):-1
+    ]
+
+    avg_volume = previous_10.mean()
+
     if avg_volume <= 0:
-        return None
+        return np.nan, "No Data"
 
-    ratio = current["quote_volume"] / avg_volume
+    ratio = current_volume / avg_volume
 
-    return {
-        "vol_x": round(float(ratio), 2),
-        "one_h_change": round(
-            float(pct(current["close"], current["open"])), 2
-        ),
-        "price": float(current["close"]),
-        "quote_volume": float(current["quote_volume"]),
-    }
+    if ratio >= STRONG_EXPANSION:
+        label = "Strong Expansion"
 
+    elif ratio >= VOLUME_EXPANSION:
+        label = "Volume Expansion"
+
+    else:
+        label = "Normal"
+
+    return ratio, label
+
+
+# ============================================================
+# RESISTANCE
+# ============================================================
+
+def analyze_resistance(df):
+    """
+    Uses recent swing high as practical resistance reference.
+    """
+
+    if len(df) < RESISTANCE_LOOKBACK:
+        return np.nan, np.nan, False
+
+    recent = df.tail(RESISTANCE_LOOKBACK)
+
+    resistance = recent["high"].max()
+    current_price = recent["close"].iloc[-1]
+
+    if resistance <= 0:
+        return np.nan, np.nan, False
+
+    distance_pct = (
+        (resistance - current_price)
+        / resistance
+    ) * 100
+
+    near_resistance = (
+        distance_pct >= 0
+        and distance_pct <= RESISTANCE_DISTANCE_PCT
+    )
+
+    return resistance, distance_pct, near_resistance
+
+
+# ============================================================
+# SCAN ONE SYMBOL
+# ============================================================
 
 def scan_symbol(symbol):
+
     try:
-        d4 = get_klines(symbol, "4h", 70)
-        d1 = get_klines(symbol, "1h", 50)
+        df4 = get_klines(
+            symbol,
+            INTERVAL_4H,
+            max(LOOKBACK_4H + 10, RESISTANCE_LOOKBACK + 10),
+        )
 
-        a = accumulation_score(d4)
-        v = volume_expansion(d1)
+        df1 = get_klines(
+            symbol,
+            INTERVAL_1H,
+            VOLUME_LOOKBACK_1H + 5,
+        )
 
-        if not a or not v:
+        if df4.empty or df1.empty:
             return None
 
-        closed = d1.iloc[:-1]
+        accumulation, acc_details = detect_accumulation(df4)
 
-        h6 = (
-            pct(closed["close"].iloc[-1], closed["close"].iloc[-7])
-            if len(closed) >= 7 else np.nan
+        volume_ok, volume_ratio_4h = analyze_4h_volume(df4)
+
+        volume_ratio_1h, volume_status = analyze_1h_volume(df1)
+
+        resistance, resistance_distance, near_resistance = (
+            analyze_resistance(df4)
         )
 
-        h24 = (
-            pct(closed["close"].iloc[-1], closed["close"].iloc[-25])
-            if len(closed) >= 25 else np.nan
+        current_price = df1["close"].iloc[-1]
+
+        # Overall highlight
+        accumulation_expansion = (
+            accumulation
+            and volume_status in [
+                "Volume Expansion",
+                "Strong Expansion",
+            ]
         )
 
-        vol_component = np.clip(
-            (v["vol_x"] - 1) / 4 * 100,
-            0, 100
+        strong_signal = (
+            accumulation
+            and volume_status == "Strong Expansion"
         )
 
-        radar_score = a["acc_score"] * 0.55 + vol_component * 0.45
+        # Only calculate score for sorting
+        score = 0
+
+        if accumulation:
+            score += 3
+
+        if volume_ok:
+            score += 1
+
+        if volume_status == "Volume Expansion":
+            score += 2
+
+        if volume_status == "Strong Expansion":
+            score += 4
+
+        if near_resistance:
+            score += 1
 
         return {
             "Symbol": symbol,
-            "Radar Score": round(float(radar_score), 1),
-            "4H Accumulation": a["acc_score"],
-            "1H Volume X": v["vol_x"],
-            "1H %": v["one_h_change"],
-            "6H %": round(float(h6), 2),
-            "24H %": round(float(h24), 2),
-            "4H Range %": a["range_pct"],
-            "4H Vol Ratio": a["4h_vol_ratio"],
-            "Range Position %": a["range_position"],
-            "Price": v["price"],
-            "1H Quote Volume": v["quote_volume"],
+            "Price": current_price,
+
+            "Accumulation": accumulation,
+
+            "4H Range %": acc_details.get(
+                "range_pct",
+                np.nan,
+            ),
+
+            "4H Volume Ratio": volume_ratio_4h,
+
+            "1H Vol Ratio": volume_ratio_1h,
+
+            "Volume Status": volume_status,
+
+            "Resistance": resistance,
+
+            "Resistance Distance %": resistance_distance,
+
+            "Near Resistance": near_resistance,
+
+            "ACC + Expansion": accumulation_expansion,
+
+            "STRONG Signal": strong_signal,
+
+            "Score": score,
         }
 
     except Exception:
         return None
 
 
-# -----------------------------
-# Catalyst Radar
-# -----------------------------
+# ============================================================
+# SCANNER
+# ============================================================
 
-RSS_FEEDS = {
-    "CoinDesk": "https://www.coindesk.com/arc/outboundfeeds/rss/",
-    "Cointelegraph": "https://cointelegraph.com/rss",
-    "Decrypt": "https://decrypt.co/feed",
-    "The Block": "https://www.theblock.co/rss.xml",
-    "Binance Blog": "https://www.binance.com/en/support/announcement/rss",
-}
+def run_scanner(symbols):
 
-CATALYST_TERMS = {
-    "Institutional": [
-        "institution", "institutional", "asset manager", "fund",
-        "blackrock", "fidelity", "jpmorgan", "jp morgan",
-        "goldman", "morgan stanley", "citibank", "treasury", "etf"
-    ],
-    "Bank / Finance": [
-        "bank", "banking", "financial institution", "payment",
-        "settlement", "custody"
-    ],
-    "Partnership": [
-        "partnership", "partner", "collaboration",
-        "strategic alliance", "integrat", "adopted"
-    ],
-    "Adoption": [
-        "adoption", "mainnet", "launch", "enterprise",
-        "real-world", "rwa", "payments"
-    ],
-    "Listing": [
-        "listed", "listing", "launchpool", "launchpad", "spot listing"
-    ],
-    "Funding / Investment": [
-        "funding", "raised", "investment", "invested",
-        "series a", "series b"
-    ],
-    "Regulation": [
-        "approved", "approval", "regulator", "regulation",
-        "license", "licensed"
-    ],
-}
+    results = []
 
+    progress = st.progress(0)
+    status = st.empty()
 
-def catalyst_score(title, summary):
-    text = (title + " " + summary).lower()
+    total = len(symbols)
+    completed = 0
 
-    categories = []
-    score = 0
+    with ThreadPoolExecutor(
+        max_workers=MAX_WORKERS
+    ) as executor:
 
-    for category, terms in CATALYST_TERMS.items():
-        if any(term in text for term in terms):
-            categories.append(category)
-            score += 1
+        futures = {
+            executor.submit(scan_symbol, symbol): symbol
+            for symbol in symbols
+        }
 
-    if "Institutional" in categories:
-        score += 2
+        for future in as_completed(futures):
 
-    if "Partnership" in categories:
-        score += 1
+            result = future.result()
 
-    if "Bank / Finance" in categories:
-        score += 1
+            if result is not None:
+                results.append(result)
 
-    return score, ", ".join(categories) if categories else "General"
+            completed += 1
+
+            progress.progress(
+                min(completed / total, 1.0)
+            )
+
+            status.text(
+                f"Scanning {completed}/{total} pairs..."
+            )
+
+    progress.empty()
+    status.empty()
+
+    return pd.DataFrame(results)
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def get_catalysts():
-    rows = []
+# ============================================================
+# SIDEBAR
+# ============================================================
 
-    for source, url in RSS_FEEDS.items():
-        try:
-            feed = feedparser.parse(url)
+st.sidebar.header("Scanner Settings")
 
-            for item in feed.entries[:30]:
-                title = item.get("title", "")
-                summary = re.sub(
-                    r"<.*?>", " ",
-                    item.get("summary", "")
-                )
-
-                score, category = catalyst_score(
-                    title, summary
-                )
-
-                if score <= 0:
-                    continue
-
-                rows.append({
-                    "Source": source,
-                    "Catalyst Score": score,
-                    "Category": category,
-                    "Headline": title,
-                    "Published": item.get(
-                        "published",
-                        item.get("updated", "")
-                    ),
-                    "Link": item.get("link", ""),
-                })
-
-        except Exception:
-            continue
-
-    if not rows:
-        return pd.DataFrame()
-
-    result = pd.DataFrame(rows)
-    result = result.sort_values(
-        ["Catalyst Score", "Published"],
-        ascending=[False, False]
-    )
-
-    return result.drop_duplicates(
-        subset=["Headline"]
-    ).head(50)
-
-
-# -----------------------------
-# UI
-# -----------------------------
-
-st.title("📡 Binance Spot Accumulation + Volume Radar")
-
-st.caption(
-    "4H accumulation → 1H abnormal volume → catalyst → manual TA confirmation"
+range_limit = st.sidebar.slider(
+    "Tight Range Maximum %",
+    min_value=5.0,
+    max_value=20.0,
+    value=12.0,
+    step=0.5,
 )
 
-with st.sidebar:
-    st.header("Scanner Settings")
-
-    min_acc = st.slider(
-        "Minimum 4H accumulation score",
-        50, 90, 62
-    )
-
-    min_vol = st.slider(
-        "Minimum 1H volume expansion",
-        1.5, 10.0, 2.0, 0.5
-    )
-
-    min_quote = st.number_input(
-        "Minimum 24H quote volume (USDT)",
-        min_value=0.0,
-        value=1_000_000.0,
-        step=500_000.0
-    )
-
-    workers = st.slider(
-        "Parallel workers",
-        2, 12, 8
-    )
-
-    top_n = st.slider(
-        "Show top candidates",
-        5, 50, 20
-    )
-
-    auto_refresh = st.checkbox(
-        "Auto refresh every 60 seconds",
-        False
-    )
-
-if auto_refresh:
-    st.markdown(
-        '<meta http-equiv="refresh" content="60">',
-        unsafe_allow_html=True
-    )
-
-# -----------------------------
-# Load market universe
-# -----------------------------
-
-try:
-    ticker_data, ticker_base = get_24h_tickers()
-    spot_symbols = set(get_spot_usdt_symbols())
-
-    ticker_df = pd.DataFrame(ticker_data)
-
-    ticker_df["quoteVolume"] = pd.to_numeric(
-        ticker_df["quoteVolume"],
-        errors="coerce"
-    )
-
-    eligible = ticker_df[
-        ticker_df["symbol"].isin(spot_symbols)
-        & (ticker_df["quoteVolume"] >= min_quote)
-    ]
-
-    symbols = sorted(
-        eligible["symbol"].dropna().unique().tolist()
-    )
-
-except Exception as e:
-    st.error(
-        "Binance public market-data endpoints could not be reached "
-        "from this Streamlit Cloud instance."
-    )
-
-    st.code(str(e))
-
-    st.info(
-        "The app now tries Binance's public data-api host and several "
-        "documented alternate API hosts. If all are blocked, the "
-        "Cloud region/network is preventing access."
-    )
-
-    st.stop()
-
-st.success(
-    f"Market data connected via: {ticker_base}"
+resistance_limit = st.sidebar.slider(
+    "Resistance Distance %",
+    min_value=1.0,
+    max_value=10.0,
+    value=3.0,
+    step=0.5,
 )
 
-st.info(
-    f"Scanning {len(symbols):,} liquid Binance USDT spot pairs. "
-    "1H volume X = latest completed 1H candle / previous 20 completed 1H average."
+min_volume_ratio = st.sidebar.slider(
+    "Minimum 4H Volume Ratio",
+    min_value=0.50,
+    max_value=1.50,
+    value=0.80,
+    step=0.05,
 )
+
+st.sidebar.markdown("---")
+
+st.sidebar.write(
+    f"Volume Expansion: **≥ {VOLUME_EXPANSION}×**"
+)
+
+st.sidebar.write(
+    f"Strong Expansion: **≥ {STRONG_EXPANSION}×**"
+)
+
+
+# ============================================================
+# APPLY SIDEBAR VALUES
+# ============================================================
+
+# Update globals from UI
+RANGE_TIGHT_LIMIT = range_limit
+RESISTANCE_DISTANCE_PCT = resistance_limit
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+col1, col2, col3 = st.columns(3)
+
+with col1:
+    st.metric(
+        "Volume Expansion",
+        f"≥ {VOLUME_EXPANSION}×",
+    )
+
+with col2:
+    st.metric(
+        "Strong Expansion",
+        f"≥ {STRONG_EXPANSION}×",
+    )
+
+with col3:
+    st.metric(
+        "4H Range Limit",
+        f"≤ {range_limit:.1f}%",
+    )
+
+
+st.markdown("---")
+
 
 if st.button(
-    "🔄 Scan Now",
+    "🔎 Scan Binance USDT Pairs",
     type="primary",
-    use_container_width=True
+    use_container_width=True,
 ):
-    st.cache_data.clear()
-    st.rerun()
 
-# -----------------------------
-# Scanner
-# -----------------------------
+    with st.spinner("Loading Binance Spot pairs..."):
 
-progress = st.progress(
-    0,
-    text="Scanning Binance Spot market..."
-)
+        symbols = get_usdt_symbols()
 
-results = []
+    st.info(
+        f"Found {len(symbols)} Binance Spot USDT pairs."
+    )
 
-with ThreadPoolExecutor(
-    max_workers=workers
-) as executor:
-
-    futures = {
-        executor.submit(scan_symbol, symbol): symbol
-        for symbol in symbols
-    }
-
-    total = len(futures)
-
-    for i, future in enumerate(
-        as_completed(futures),
-        1
+    with st.spinner(
+        "Scanning 4H + 1H market structure..."
     ):
-        result = future.result()
 
-        if result:
-            results.append(result)
+        results = run_scanner(symbols)
 
-        progress.progress(
-            i / max(total, 1),
-            text=f"Scanning {i:,}/{total:,}"
-        )
+    if results.empty:
 
-progress.empty()
-
-df = pd.DataFrame(results)
-
-if df.empty:
-
-    st.warning(
-        "No candidates passed the current filters."
-    )
-
-else:
-
-    df = df[
-        (df["4H Accumulation"] >= min_acc)
-        & (df["1H Volume X"] >= min_vol)
-    ].copy()
-
-    df = df.sort_values(
-        ["Radar Score", "1H Volume X"],
-        ascending=False
-    ).head(top_n)
-
-    st.subheader(
-        "🔥 4H Accumulation → 1H Volume Expansion"
-    )
-
-    if df.empty:
         st.warning(
-            "Market scanned successfully, but no pair "
-            "passed your current thresholds."
+            "No valid market data was returned."
         )
+
     else:
 
-        columns = [
+        # Sort by strongest signals first
+        results = results.sort_values(
+            by=[
+                "STRONG Signal",
+                "ACC + Expansion",
+                "Score",
+                "1H Vol Ratio",
+            ],
+            ascending=False,
+        )
+
+        # ====================================================
+        # SIGNAL SUMMARY
+        # ====================================================
+
+        strong = results[
+            results["STRONG Signal"] == True
+        ]
+
+        acc_expansion = results[
+            results["ACC + Expansion"] == True
+        ]
+
+        volume_expansion = results[
+            results["Volume Status"].isin(
+                [
+                    "Volume Expansion",
+                    "Strong Expansion",
+                ]
+            )
+        ]
+
+        c1, c2, c3 = st.columns(3)
+
+        c1.metric(
+            "Accumulation + Expansion",
+            len(acc_expansion),
+        )
+
+        c2.metric(
+            "Strong Expansion",
+            len(strong),
+        )
+
+        c3.metric(
+            "Any Volume Expansion",
+            len(volume_expansion),
+        )
+
+        # ====================================================
+        # HIGHLIGHT SECTION
+        # ====================================================
+
+        st.markdown("## 🚨 Accumulation + Volume Expansion")
+
+        if acc_expansion.empty:
+
+            st.info(
+                "No Accumulation + Volume Expansion pair found."
+            )
+
+        else:
+
+            highlight_cols = [
+                "Symbol",
+                "Price",
+                "Accumulation",
+                "4H Range %",
+                "4H Volume Ratio",
+                "1H Vol Ratio",
+                "Volume Status",
+                "Resistance Distance %",
+                "Near Resistance",
+            ]
+
+            highlight_df = acc_expansion[
+                highlight_cols
+            ].copy()
+
+            st.dataframe(
+                highlight_df,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Price": st.column_config.NumberColumn(
+                        format="%.8f"
+                    ),
+                    "4H Range %": st.column_config.NumberColumn(
+                        format="%.2f%%"
+                    ),
+                    "4H Volume Ratio": st.column_config.NumberColumn(
+                        format="%.2fx"
+                    ),
+                    "1H Vol Ratio": st.column_config.NumberColumn(
+                        format="%.2fx"
+                    ),
+                    "Resistance Distance %": st.column_config.NumberColumn(
+                        format="%.2f%%"
+                    ),
+                },
+            )
+
+        # ====================================================
+        # STRONG SIGNAL
+        # ====================================================
+
+        st.markdown("## 🔥 Accumulation + Strong Expansion")
+
+        if strong.empty:
+
+            st.info(
+                "No Accumulation + Strong Expansion pair found."
+            )
+
+        else:
+
+            strong_cols = [
+                "Symbol",
+                "Price",
+                "4H Range %",
+                "4H Volume Ratio",
+                "1H Vol Ratio",
+                "Volume Status",
+                "Resistance Distance %",
+                "Near Resistance",
+            ]
+
+            st.dataframe(
+                strong[strong_cols],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        # ====================================================
+        # FULL SCAN
+        # ====================================================
+
+        st.markdown("## 📋 Full Scan")
+
+        filter_col1, filter_col2 = st.columns(2)
+
+        with filter_col1:
+
+            show_only_acc = st.checkbox(
+                "Only Accumulation"
+            )
+
+        with filter_col2:
+
+            show_only_expansion = st.checkbox(
+                "Only Volume Expansion"
+            )
+
+        display_df = results.copy()
+
+        if show_only_acc:
+
+            display_df = display_df[
+                display_df["Accumulation"] == True
+            ]
+
+        if show_only_expansion:
+
+            display_df = display_df[
+                display_df["Volume Status"].isin(
+                    [
+                        "Volume Expansion",
+                        "Strong Expansion",
+                    ]
+                )
+            ]
+
+        display_cols = [
             "Symbol",
-            "Radar Score",
-            "4H Accumulation",
-            "1H Volume X",
-            "1H %",
-            "6H %",
-            "24H %",
-            "4H Range %",
-            "4H Vol Ratio",
-            "Range Position %",
             "Price",
+            "Accumulation",
+            "4H Range %",
+            "4H Volume Ratio",
+            "1H Vol Ratio",
+            "Volume Status",
+            "Resistance Distance %",
+            "Near Resistance",
+            "ACC + Expansion",
+            "STRONG Signal",
+            "Score",
         ]
 
         st.dataframe(
-            df[columns],
+            display_df[display_cols],
             use_container_width=True,
             hide_index=True,
             column_config={
-                "Radar Score":
-                    st.column_config.NumberColumn(
-                        format="%.1f"
-                    ),
-                "4H Accumulation":
-                    st.column_config.NumberColumn(
-                        format="%.1f"
-                    ),
-                "1H Volume X":
-                    st.column_config.NumberColumn(
-                        format="%.2fx"
-                    ),
-                "1H %":
-                    st.column_config.NumberColumn(
-                        format="%.2f%%"
-                    ),
-                "6H %":
-                    st.column_config.NumberColumn(
-                        format="%.2f%%"
-                    ),
-                "24H %":
-                    st.column_config.NumberColumn(
-                        format="%.2f%%"
-                    ),
-                "4H Range %":
-                    st.column_config.NumberColumn(
-                        format="%.2f%%"
-                    ),
-                "4H Vol Ratio":
-                    st.column_config.NumberColumn(
-                        format="%.2fx"
-                    ),
-                "Range Position %":
-                    st.column_config.NumberColumn(
-                        format="%.1f%%"
-                    ),
-                "Price":
-                    st.column_config.NumberColumn(
-                        format="%.8g"
-                    ),
-            }
+                "Price": st.column_config.NumberColumn(
+                    format="%.8f"
+                ),
+                "4H Range %": st.column_config.NumberColumn(
+                    format="%.2f%%"
+                ),
+                "4H Volume Ratio": st.column_config.NumberColumn(
+                    format="%.2fx"
+                ),
+                "1H Vol Ratio": st.column_config.NumberColumn(
+                    format="%.2fx"
+                ),
+                "Resistance Distance %": st.column_config.NumberColumn(
+                    format="%.2f%%"
+                ),
+            },
         )
 
-        st.caption(
-            "Scanner candidate ≠ entry. Confirm structure, support, "
-            "breakout, volume quality, BTC context and invalidation manually."
+        # ====================================================
+        # CSV DOWNLOAD
+        # ====================================================
+
+        csv = results.to_csv(
+            index=False
+        ).encode("utf-8")
+
+        st.download_button(
+            "⬇️ Download Full Scan CSV",
+            csv,
+            "binance_usdt_scan.csv",
+            "text/csv",
+            use_container_width=True,
         )
 
-# -----------------------------
-# Catalyst
-# -----------------------------
+        st.success(
+            f"Scan complete — {len(results)} pairs processed."
+        )
 
-st.divider()
-
-st.header("🧠 Catalyst Radar")
-
-st.caption(
-    "Keyword-based public-news radar. Verify the original article "
-    "before treating a headline as a material catalyst."
-)
-
-catalysts = get_catalysts()
-
-if catalysts.empty:
-
-    st.warning(
-        "No matching catalyst headlines found."
-    )
 
 else:
 
-    for _, row in catalysts.head(20).iterrows():
-
-        st.markdown(
-            f"**{row['Catalyst Score']}★ · "
-            f"{row['Category']} · {row['Source']}**"
-        )
-
-        st.markdown(
-            f"**{row['Headline']}**"
-        )
-
-        st.caption(
-            f"{row['Published']}  |  "
-            f"[Open original source]({row['Link']})"
-        )
-
-        st.divider()
-
-# -----------------------------
-# Workflow
-# -----------------------------
-
-st.subheader("Your workflow")
-
-st.markdown("""
-**Scanner**
-→ 4H accumulation  
-→ 1H 2x / 3x / 5x+ volume expansion  
-→ Catalyst check  
-→ 4H structure / support  
-→ ascending triangle or other valid setup  
-→ volume power  
-→ breakout  
-→ 1H confirmation  
-→ manual entry + predefined invalidation
-
-This app is a screening tool, not an automatic trading system.
-""")
-
-st.caption(
-    "Last scan: "
-    + datetime.now(timezone.utc).strftime(
-        "%Y-%m-%d %H:%M:%S UTC"
+    st.info(
+        "👆 Click **Scan Binance USDT Pairs** to start."
     )
-)
+
+    st.markdown(
+        """
+### Scanner Logic
+
+**4H**
+- Accumulation structure
+- Tight consolidation range
+- Volatility contraction
+- Stable/increasing volume
+- Breakdown avoidance
+
+**1H**
+- Current 1H volume ÷ previous 10-candle average
+- `≥ 1.5×` → Volume Expansion
+- `≥ 3×` → Strong Expansion
+
+**Highlight**
+- 🟡 Accumulation + Volume Expansion
+- 🔥 Accumulation + Strong Expansion
+- Resistance proximity shown separately
+"""
+    )
