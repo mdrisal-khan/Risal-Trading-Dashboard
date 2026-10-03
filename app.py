@@ -20,7 +20,8 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-BINANCE_BASE = "https://api.binance.com"
+# Changed to Binance official public market data mirror to fix HTTP 451 Error
+BINANCE_BASE = "https://data.binance.com"
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "Binance-Spot-Scanner/1.0"})
 
