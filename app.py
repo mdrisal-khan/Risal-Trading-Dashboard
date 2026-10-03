@@ -8,7 +8,7 @@ import streamlit as st
 
 
 # ============================================================
-# APP CONFIG
+# PAGE CONFIG
 # ============================================================
 
 st.set_page_config(
@@ -22,8 +22,6 @@ st.set_page_config(
 # BINANCE CONFIG
 # ============================================================
 
-# Public market-data endpoint.
-# No API key is required.
 BINANCE_ENDPOINTS = [
     "https://data-api.binance.vision",
     "https://api.binance.com",
@@ -34,16 +32,13 @@ BINANCE_ENDPOINTS = [
     "https://api4.binance.com",
 ]
 
-API_PATH_EXCHANGE_INFO = "/api/v3/exchangeInfo"
-API_PATH_KLINES = "/api/v3/klines"
+EXCHANGE_INFO_PATH = "/api/v3/exchangeInfo"
+KLINES_PATH = "/api/v3/klines"
+PING_PATH = "/api/v3/ping"
 
 REQUEST_TIMEOUT = 15
-
-# Keep concurrency moderate to reduce rate-limit problems.
-MAX_WORKERS = 6
-
-# Retry count per endpoint.
 MAX_RETRIES = 3
+MAX_WORKERS = 6
 
 
 # ============================================================
@@ -51,89 +46,36 @@ MAX_RETRIES = 3
 # ============================================================
 
 DEFAULT_RANGE_LIMIT = 12.0
-
 DEFAULT_RESISTANCE_DISTANCE = 3.0
-
 DEFAULT_4H_VOLUME_MIN_RATIO = 0.80
 
 VOLUME_EXPANSION = 1.5
-
 STRONG_EXPANSION = 3.0
 
 LOOKBACK_4H = 36
-
 ACCUMULATION_RANGE_CANDLES = 12
-
 RESISTANCE_LOOKBACK = 30
-
 VOLUME_LOOKBACK_1H = 10
 
 
 # ============================================================
-# HTTP SESSION
+# HTTP
 # ============================================================
 
 HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 "
-        "(Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 "
-        "Chrome/140.0 Safari/537.36"
-    ),
+    "User-Agent": "Mozilla/5.0 Binance-Scanner/2.0",
     "Accept": "application/json",
 }
-
 
 session = requests.Session()
 session.headers.update(HEADERS)
 
 
 # ============================================================
-# UTILITY
-# ============================================================
-
-def format_price(value):
-    if value is None or pd.isna(value):
-        return "-"
-
-    value = float(value)
-
-    if value >= 1000:
-        return f"{value:,.2f}"
-
-    if value >= 1:
-        return f"{value:,.4f}"
-
-    if value >= 0.01:
-        return f"{value:,.6f}"
-
-    return f"{value:.10f}"
-
-
-def safe_float(value):
-    try:
-        return float(value)
-    except Exception:
-        return np.nan
-
-
-# ============================================================
-# BINANCE REQUEST
+# API REQUEST
 # ============================================================
 
 def binance_get(path, params=None):
-    """
-    Try Binance public endpoints with retries and fallback hosts.
-
-    Handles:
-    - timeout
-    - connection error
-    - HTTP 403
-    - HTTP 418
-    - HTTP 429
-    - server errors
-    - invalid JSON
-    """
 
     last_error = None
 
@@ -153,26 +95,15 @@ def binance_get(path, params=None):
 
                 status = response.status_code
 
-                # -------------------------------
-                # SUCCESS
-                # -------------------------------
-
                 if status == 200:
 
                     try:
                         return response.json()
-
                     except ValueError:
-
                         last_error = (
                             f"Invalid JSON from {base_url}"
                         )
-
                         break
-
-                # -------------------------------
-                # RATE LIMIT
-                # -------------------------------
 
                 if status in (418, 429):
 
@@ -181,30 +112,17 @@ def binance_get(path, params=None):
                     )
 
                     try:
-                        wait_seconds = float(
-                            retry_after
-                        )
+                        wait = float(retry_after)
                     except Exception:
-                        wait_seconds = (
-                            2 ** attempt
-                        )
+                        wait = 2 ** attempt
 
-                    wait_seconds = min(
-                        wait_seconds,
-                        15,
-                    )
-
-                    time.sleep(wait_seconds)
+                    time.sleep(min(wait, 15))
 
                     last_error = (
                         f"Rate limited: HTTP {status}"
                     )
 
                     continue
-
-                # -------------------------------
-                # WAF / BLOCK
-                # -------------------------------
 
                 if status == 403:
 
@@ -213,10 +131,6 @@ def binance_get(path, params=None):
                     )
 
                     break
-
-                # -------------------------------
-                # SERVER ERROR
-                # -------------------------------
 
                 if status >= 500:
 
@@ -229,10 +143,6 @@ def binance_get(path, params=None):
                     )
 
                     continue
-
-                # -------------------------------
-                # OTHER HTTP ERROR
-                # -------------------------------
 
                 try:
                     body = response.json()
@@ -279,19 +189,19 @@ def binance_get(path, params=None):
 
 
 # ============================================================
-# GET SYMBOLS
+# SYMBOLS
 # ============================================================
 
 @st.cache_data(ttl=600)
 def get_usdt_symbols():
 
     data = binance_get(
-        API_PATH_EXCHANGE_INFO
+        EXCHANGE_INFO_PATH
     )
 
     if not isinstance(data, dict):
         raise RuntimeError(
-            "Binance exchangeInfo returned invalid data."
+            "Invalid Binance exchangeInfo response."
         )
 
     symbols = []
@@ -306,21 +216,20 @@ def get_usdt_symbols():
                 False,
             )
         ):
-
             symbols.append(
                 item["symbol"]
             )
 
     if not symbols:
         raise RuntimeError(
-            "No Binance Spot USDT pairs found."
+            "No Spot USDT pairs found."
         )
 
     return sorted(symbols)
 
 
 # ============================================================
-# GET KLINES
+# KLINES
 # ============================================================
 
 @st.cache_data(ttl=60)
@@ -331,7 +240,7 @@ def get_klines(
 ):
 
     data = binance_get(
-        API_PATH_KLINES,
+        KLINES_PATH,
         params={
             "symbol": symbol,
             "interval": interval,
@@ -377,10 +286,10 @@ def get_klines(
         "taker_buy_quote",
     ]
 
-    for column in numeric_columns:
+    for col in numeric_columns:
 
-        df[column] = pd.to_numeric(
-            df[column],
+        df[col] = pd.to_numeric(
+            df[col],
             errors="coerce",
         )
 
@@ -400,7 +309,7 @@ def get_klines(
 
 
 # ============================================================
-# 4H ACCUMULATION DETECTION
+# 4H ACCUMULATION
 # ============================================================
 
 def detect_accumulation(
@@ -409,18 +318,22 @@ def detect_accumulation(
     volume_min_ratio,
 ):
 
-    if len(df) < LOOKBACK_4H:
+    default = {
+        "accumulation": False,
+        "tight_range": False,
+        "range_pct": np.nan,
+        "volatility_ratio": np.nan,
+        "volume_ratio": np.nan,
+        "volume_ok": False,
+        "breakdown": False,
+        "trend_change_pct": np.nan,
+        "price_position": np.nan,
+        "range_high": np.nan,
+        "range_low": np.nan,
+    }
 
-        return {
-            "accumulation": False,
-            "tight_range": False,
-            "range_pct": np.nan,
-            "volatility_ratio": np.nan,
-            "volume_ratio": np.nan,
-            "volume_ok": False,
-            "breakdown": False,
-            "trend_change_pct": np.nan,
-        }
+    if len(df) < LOOKBACK_4H:
+        return default
 
     d = df.tail(
         LOOKBACK_4H
@@ -430,26 +343,11 @@ def detect_accumulation(
         ACCUMULATION_RANGE_CANDLES
     ).copy()
 
-    # --------------------------------------------------------
-    # RANGE
-    # --------------------------------------------------------
-
     range_high = recent["high"].max()
-
     range_low = recent["low"].min()
 
     if range_low <= 0:
-
-        return {
-            "accumulation": False,
-            "tight_range": False,
-            "range_pct": np.nan,
-            "volatility_ratio": np.nan,
-            "volume_ratio": np.nan,
-            "volume_ok": False,
-            "breakdown": False,
-            "trend_change_pct": np.nan,
-        }
+        return default
 
     range_pct = (
         (range_high - range_low)
@@ -461,7 +359,7 @@ def detect_accumulation(
     )
 
     # --------------------------------------------------------
-    # VOLATILITY CONTRACTION
+    # VOLATILITY
     # --------------------------------------------------------
 
     d["returns"] = (
@@ -486,7 +384,6 @@ def detect_accumulation(
     ):
 
         volatility_ratio = np.nan
-
         volatility_contracting = False
 
     else:
@@ -533,16 +430,11 @@ def detect_accumulation(
     )
 
     # --------------------------------------------------------
-    # PRICE TREND
+    # TREND
     # --------------------------------------------------------
 
-    first_close = (
-        recent["close"].iloc[0]
-    )
-
-    last_close = (
-        recent["close"].iloc[-1]
-    )
+    first_close = recent["close"].iloc[0]
+    last_close = recent["close"].iloc[-1]
 
     if first_close > 0:
 
@@ -555,7 +447,6 @@ def detect_accumulation(
 
         trend_change_pct = np.nan
 
-    # Don't classify an aggressive dump as accumulation.
     not_strong_downtrend = (
         trend_change_pct > -8
     )
@@ -564,21 +455,25 @@ def detect_accumulation(
     # BREAKDOWN
     # --------------------------------------------------------
 
-    previous_range_low = (
-        recent["low"].iloc[:-1].min()
-    )
+    if len(recent) > 1:
 
-    current_close = (
-        recent["close"].iloc[-1]
-    )
+        previous_low = (
+            recent["low"]
+            .iloc[:-1]
+            .min()
+        )
 
-    breakdown = (
-        current_close
-        < previous_range_low * 0.985
-    )
+        breakdown = (
+            last_close
+            < previous_low * 0.985
+        )
+
+    else:
+
+        breakdown = False
 
     # --------------------------------------------------------
-    # PRICE LOCATION
+    # PRICE POSITION
     # --------------------------------------------------------
 
     range_size = (
@@ -588,17 +483,13 @@ def detect_accumulation(
     if range_size > 0:
 
         price_position = (
-            (current_close - range_low)
+            (last_close - range_low)
             / range_size
-        )
+        ) * 100
 
     else:
 
-        price_position = 0.5
-
-    # --------------------------------------------------------
-    # FINAL ACCUMULATION
-    # --------------------------------------------------------
+        price_position = 50.0
 
     accumulation = all(
         [
@@ -619,14 +510,14 @@ def detect_accumulation(
         "volume_ok": volume_ok,
         "breakdown": breakdown,
         "trend_change_pct": trend_change_pct,
-        "price_position": price_position * 100,
+        "price_position": price_position,
         "range_high": range_high,
         "range_low": range_low,
     }
 
 
 # ============================================================
-# 4H VOLUME ANALYSIS
+# 4H VOLUME
 # ============================================================
 
 def analyze_4h_volume(
@@ -635,42 +526,33 @@ def analyze_4h_volume(
 ):
 
     if len(df) < 20:
-
         return False, np.nan
 
-    recent_volume = (
+    recent = (
         df["volume"]
         .tail(8)
         .mean()
     )
 
-    previous_volume = (
+    previous = (
         df["volume"]
         .iloc[-16:-8]
         .mean()
     )
 
-    if previous_volume <= 0:
-
+    if previous <= 0:
         return False, np.nan
 
-    ratio = (
-        recent_volume
-        / previous_volume
-    )
-
-    stable_or_increasing = (
-        ratio >= minimum_ratio
-    )
+    ratio = recent / previous
 
     return (
-        stable_or_increasing,
+        ratio >= minimum_ratio,
         ratio,
     )
 
 
 # ============================================================
-# 1H VOLUME EXPANSION
+# 1H VOLUME
 # ============================================================
 
 def analyze_1h_volume(df):
@@ -684,7 +566,6 @@ def analyze_1h_volume(df):
             "Insufficient Data",
         )
 
-    # Latest 1H candle = current 1H volume
     current_volume = (
         df["volume"].iloc[-1]
     )
@@ -727,19 +608,16 @@ def analyze_1h_volume(df):
 
         status = "Normal"
 
-    return (
-        ratio,
-        status,
-    )
+    return ratio, status
 
 
 # ============================================================
-# RESISTANCE ANALYSIS
+# RESISTANCE
 # ============================================================
 
 def analyze_resistance(
     df,
-    resistance_distance_limit,
+    distance_limit,
 ):
 
     if len(df) < RESISTANCE_LOOKBACK:
@@ -758,8 +636,7 @@ def analyze_resistance(
         recent["close"].iloc[-1]
     )
 
-    # Exclude the current candle's high
-    # to avoid calling the current price itself resistance.
+    # Exclude current candle.
     resistance = (
         recent["high"]
         .iloc[:-1]
@@ -782,22 +659,16 @@ def analyze_resistance(
         / resistance
     ) * 100
 
-    # If price has already broken resistance,
-    # mark it separately rather than "near resistance".
-    broken = (
-        current_price > resistance
-    )
-
-    near_resistance = (
-        not broken
+    near = (
+        current_price <= resistance
         and distance_pct >= 0
-        and distance_pct <= resistance_distance_limit
+        and distance_pct <= distance_limit
     )
 
     return (
         resistance,
         distance_pct,
-        near_resistance,
+        near,
     )
 
 
@@ -809,42 +680,47 @@ def calculate_score(row):
 
     score = 0
 
-    if row["Accumulation"]:
+    if bool(row.get("Accumulation", False)):
         score += 3
 
-    if row["4H Tight Range"]:
+    if bool(row.get("4H Tight Range", False)):
         score += 1
 
-    if row["4H Volume Stable"]:
+    if bool(row.get("4H Volume Stable", False)):
         score += 1
 
-    if row["Volume Status"] == "Volume Expansion":
+    volume_status = row.get(
+        "Volume Status",
+        "",
+    )
+
+    if volume_status == "Volume Expansion":
         score += 2
 
-    if row["Volume Status"] == "Strong Expansion":
+    elif volume_status == "Strong Expansion":
         score += 4
 
-    if row["Near Resistance"]:
+    if bool(row.get("Near Resistance", False)):
         score += 1
 
     return score
 
 
 # ============================================================
-# SCAN ONE SYMBOL
+# SCAN SYMBOL
 # ============================================================
 
 def scan_symbol(
     symbol,
     range_limit,
     volume_min_ratio,
-    resistance_distance_limit,
+    resistance_distance,
 ):
 
     try:
 
         # ----------------------------------------------------
-        # 4H DATA
+        # 4H
         # ----------------------------------------------------
 
         df4 = get_klines(
@@ -856,29 +732,16 @@ def scan_symbol(
             ),
         )
 
-        if df4.empty:
+        if df4.empty or len(df4) < 20:
             return None
 
-        if len(df4) < 20:
-            return None
-
-        # ----------------------------------------------------
-        # 4H ACCUMULATION
-        # ----------------------------------------------------
-
-        accumulation_data = (
-            detect_accumulation(
-                df4,
-                range_limit,
-                volume_min_ratio,
-            )
+        acc = detect_accumulation(
+            df4,
+            range_limit,
+            volume_min_ratio,
         )
 
-        # ----------------------------------------------------
-        # 4H VOLUME
-        # ----------------------------------------------------
-
-        volume_ok, volume_ratio_4h = (
+        volume_4h_ok, volume_4h_ratio = (
             analyze_4h_volume(
                 df4,
                 volume_min_ratio,
@@ -886,7 +749,7 @@ def scan_symbol(
         )
 
         # ----------------------------------------------------
-        # 1H DATA
+        # 1H
         # ----------------------------------------------------
 
         df1 = get_klines(
@@ -898,7 +761,7 @@ def scan_symbol(
         if df1.empty:
             return None
 
-        volume_ratio_1h, volume_status = (
+        volume_1h_ratio, volume_status = (
             analyze_1h_volume(df1)
         )
 
@@ -908,35 +771,31 @@ def scan_symbol(
 
         (
             resistance,
-            resistance_distance,
+            resistance_distance_pct,
             near_resistance,
         ) = analyze_resistance(
             df4,
-            resistance_distance_limit,
+            resistance_distance,
         )
-
-        # ----------------------------------------------------
-        # PRICE
-        # ----------------------------------------------------
 
         current_price = (
             df1["close"].iloc[-1]
         )
 
         # ----------------------------------------------------
-        # HIGHLIGHTS
+        # SIGNALS
         # ----------------------------------------------------
 
-        accumulation = (
-            accumulation_data["accumulation"]
+        accumulation = bool(
+            acc["accumulation"]
         )
 
-        accumulation_expansion = (
+        acc_expansion = (
             accumulation
-            and volume_status in [
+            and volume_status in (
                 "Volume Expansion",
                 "Strong Expansion",
-            ]
+            )
         )
 
         strong_signal = (
@@ -945,40 +804,30 @@ def scan_symbol(
             == "Strong Expansion"
         )
 
-        # ----------------------------------------------------
-        # RESULT
-        # ----------------------------------------------------
-
         result = {
             "Symbol": symbol,
-
             "Price": current_price,
 
-            "Accumulation": accumulation,
+            "Accumulation":
+                accumulation,
 
             "4H Tight Range":
-                accumulation_data[
-                    "tight_range"
-                ],
+                bool(acc["tight_range"]),
 
             "4H Range %":
-                accumulation_data[
-                    "range_pct"
-                ],
+                acc["range_pct"],
 
             "4H Vol Ratio":
-                volume_ratio_4h,
+                volume_4h_ratio,
 
             "4H Volume Stable":
-                volume_ok,
+                bool(volume_4h_ok),
 
             "4H Volatility Ratio":
-                accumulation_data[
-                    "volatility_ratio"
-                ],
+                acc["volatility_ratio"],
 
             "1H Vol Ratio":
-                volume_ratio_1h,
+                volume_1h_ratio,
 
             "Volume Status":
                 volume_status,
@@ -987,16 +836,16 @@ def scan_symbol(
                 resistance,
 
             "Resistance Distance %":
-                resistance_distance,
+                resistance_distance_pct,
 
             "Near Resistance":
-                near_resistance,
+                bool(near_resistance),
 
             "ACC + Expansion":
-                accumulation_expansion,
+                bool(acc_expansion),
 
             "STRONG Signal":
-                strong_signal,
+                bool(strong_signal),
 
             "Score": 0,
         }
@@ -1008,27 +857,33 @@ def scan_symbol(
         return result
 
     except Exception:
+
+        # One bad symbol must NEVER
+        # stop the complete scan.
         return None
 
 
 # ============================================================
-# SCAN ALL
+# RUN SCANNER
 # ============================================================
 
 def run_scanner(
     symbols,
     range_limit,
     volume_min_ratio,
-    resistance_distance_limit,
+    resistance_distance,
 ):
 
     results = []
 
     total = len(symbols)
 
+    if total == 0:
+        return pd.DataFrame()
+
     progress = st.progress(0)
 
-    status_text = st.empty()
+    status = st.empty()
 
     completed = 0
 
@@ -1036,27 +891,22 @@ def run_scanner(
         max_workers=MAX_WORKERS
     ) as executor:
 
-        future_map = {}
-
-        for symbol in symbols:
-
-            future = executor.submit(
+        futures = {
+            executor.submit(
                 scan_symbol,
                 symbol,
                 range_limit,
                 volume_min_ratio,
-                resistance_distance_limit,
-            )
-
-            future_map[future] = symbol
+                resistance_distance,
+            ): symbol
+            for symbol in symbols
+        }
 
         for future in as_completed(
-            future_map
+            futures
         ):
 
             completed += 1
-
-            symbol = future_map[future]
 
             try:
 
@@ -1066,24 +916,21 @@ def run_scanner(
                     results.append(result)
 
             except Exception:
+
                 pass
 
             progress.progress(
-                min(
-                    completed / total,
-                    1.0,
-                )
+                completed / total
             )
 
-            status_text.write(
-                f"Scanning: "
-                f"{completed}/{total} "
-                f"— {symbol}"
+            status.write(
+                f"Scanning "
+                f"{completed}/{total}"
             )
 
     progress.empty()
 
-    status_text.empty()
+    status.empty()
 
     if not results:
         return pd.DataFrame()
@@ -1092,18 +939,109 @@ def run_scanner(
 
 
 # ============================================================
-# FORMAT RESULT TABLE
+# NORMALIZE RESULT COLUMNS
 # ============================================================
 
-def format_dataframe(df):
+RESULT_COLUMNS = [
+    "Symbol",
+    "Price",
+    "Accumulation",
+    "4H Tight Range",
+    "4H Range %",
+    "4H Vol Ratio",
+    "4H Volume Stable",
+    "4H Volatility Ratio",
+    "1H Vol Ratio",
+    "Volume Status",
+    "Resistance",
+    "Resistance Distance %",
+    "Near Resistance",
+    "ACC + Expansion",
+    "STRONG Signal",
+    "Score",
+]
 
-    if df.empty:
-        return df
 
-    out = df.copy()
+def normalize_results(df):
 
-    # Sort strongest signals first.
-    out = out.sort_values(
+    if df is None or df.empty:
+
+        return pd.DataFrame(
+            columns=RESULT_COLUMNS
+        )
+
+    df = df.copy()
+
+    # Ensure every expected column exists.
+    for column in RESULT_COLUMNS:
+
+        if column not in df.columns:
+
+            if column in [
+                "Accumulation",
+                "4H Tight Range",
+                "4H Volume Stable",
+                "Near Resistance",
+                "ACC + Expansion",
+                "STRONG Signal",
+            ]:
+
+                df[column] = False
+
+            elif column == "Volume Status":
+
+                df[column] = "Normal"
+
+            elif column == "Symbol":
+
+                df[column] = ""
+
+            else:
+
+                df[column] = np.nan
+
+    # Force correct column order.
+    df = df[RESULT_COLUMNS]
+
+    # Boolean normalization.
+    boolean_columns = [
+        "Accumulation",
+        "4H Tight Range",
+        "4H Volume Stable",
+        "Near Resistance",
+        "ACC + Expansion",
+        "STRONG Signal",
+    ]
+
+    for column in boolean_columns:
+
+        df[column] = (
+            df[column]
+            .fillna(False)
+            .astype(bool)
+        )
+
+    # Numeric normalization.
+    numeric_columns = [
+        "Price",
+        "4H Range %",
+        "4H Vol Ratio",
+        "4H Volatility Ratio",
+        "1H Vol Ratio",
+        "Resistance",
+        "Resistance Distance %",
+        "Score",
+    ]
+
+    for column in numeric_columns:
+
+        df[column] = pd.to_numeric(
+            df[column],
+            errors="coerce",
+        )
+
+    # Strongest signals first.
+    df = df.sort_values(
         by=[
             "STRONG Signal",
             "ACC + Expansion",
@@ -1111,32 +1049,76 @@ def format_dataframe(df):
             "1H Vol Ratio",
         ],
         ascending=False,
+        na_position="last",
     )
 
-    return out.reset_index(
+    return df.reset_index(
         drop=True
     )
 
 
 # ============================================================
-# CUSTOM TABLE STYLE
+# SAFE TABLE
 # ============================================================
 
-def highlight_rows(row):
+def show_table(df):
 
-    if row["STRONG Signal"]:
+    if df is None or df.empty:
 
-        return [
-            "background-color: #4b160f; color: white"
-        ] * len(row)
+        st.info("No results.")
+        return
 
-    if row["ACC + Expansion"]:
+    # IMPORTANT:
+    # No pandas Styler is used here.
+    # This prevents KeyError when a filtered
+    # dataframe has a different column set.
 
-        return [
-            "background-color: #453500; color: white"
-        ] * len(row)
+    st.dataframe(
+        df,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Price": st.column_config.NumberColumn(
+                "Price",
+                format="%.8f",
+            ),
 
-    return [""] * len(row)
+            "4H Range %": st.column_config.NumberColumn(
+                "4H Range %",
+                format="%.2f%%",
+            ),
+
+            "4H Vol Ratio": st.column_config.NumberColumn(
+                "4H Vol Ratio",
+                format="%.2fx",
+            ),
+
+            "4H Volatility Ratio": st.column_config.NumberColumn(
+                "4H Volatility Ratio",
+                format="%.2fx",
+            ),
+
+            "1H Vol Ratio": st.column_config.NumberColumn(
+                "1H Vol Ratio",
+                format="%.2fx",
+            ),
+
+            "Resistance": st.column_config.NumberColumn(
+                "Resistance",
+                format="%.8f",
+            ),
+
+            "Resistance Distance %": st.column_config.NumberColumn(
+                "Resistance Distance %",
+                format="%.2f%%",
+            ),
+
+            "Score": st.column_config.NumberColumn(
+                "Score",
+                format="%d",
+            ),
+        },
+    )
 
 
 # ============================================================
@@ -1161,21 +1143,15 @@ volume_min_ratio = st.sidebar.slider(
     step=0.05,
 )
 
-resistance_distance_limit = (
-    st.sidebar.slider(
-        "Resistance Distance %",
-        min_value=1.0,
-        max_value=10.0,
-        value=DEFAULT_RESISTANCE_DISTANCE,
-        step=0.5,
-    )
+resistance_distance = st.sidebar.slider(
+    "Resistance Distance %",
+    min_value=1.0,
+    max_value=10.0,
+    value=DEFAULT_RESISTANCE_DISTANCE,
+    step=0.5,
 )
 
 st.sidebar.markdown("---")
-
-st.sidebar.markdown(
-    "### 1H Volume Rules"
-)
 
 st.sidebar.write(
     f"🟡 Volume Expansion: "
@@ -1187,10 +1163,8 @@ st.sidebar.write(
     f"**≥ {STRONG_EXPANSION:.1f}×**"
 )
 
-st.sidebar.markdown("---")
-
 st.sidebar.caption(
-    "Data source: Binance public Spot market data"
+    "Binance Spot USDT scanner"
 )
 
 
@@ -1202,44 +1176,36 @@ st.title(
     "📊 Binance Spot USDT Accumulation Scanner"
 )
 
-st.markdown(
-    """
-Scans Binance **Spot USDT pairs** for:
-
-- 4H accumulation structure
-- 4H tight range
-- 4H stable/increasing volume
-- 1H current volume vs previous 10 × average volume
-- Resistance proximity
-- Accumulation + Volume Expansion highlights
-"""
+st.write(
+    "4H accumulation + tight range + volume "
+    "confirmation + 1H volume expansion + resistance"
 )
 
 
 # ============================================================
-# METRICS
+# TOP METRICS
 # ============================================================
 
-m1, m2, m3, m4 = st.columns(4)
+a, b, c, d = st.columns(4)
 
-m1.metric(
-    "1H Expansion",
+a.metric(
+    "Volume Expansion",
     f"≥ {VOLUME_EXPANSION:.1f}×",
 )
 
-m2.metric(
+b.metric(
     "Strong Expansion",
     f"≥ {STRONG_EXPANSION:.1f}×",
 )
 
-m3.metric(
-    "4H Range",
+c.metric(
+    "4H Tight Range",
     f"≤ {range_limit:.1f}%",
 )
 
-m4.metric(
+d.metric(
     "Resistance",
-    f"≤ {resistance_distance_limit:.1f}%",
+    f"≤ {resistance_distance:.1f}%",
 )
 
 
@@ -1255,20 +1221,20 @@ with st.expander(
 ):
 
     if st.button(
-        "Test Binance Connection"
+        "Test Binance API"
     ):
 
         try:
 
-            test_data = binance_get(
-                "/api/v3/ping"
+            ping = binance_get(
+                PING_PATH
             )
 
             st.success(
                 "Binance API connection OK."
             )
 
-            st.json(test_data)
+            st.json(ping)
 
         except Exception as e:
 
@@ -1282,7 +1248,7 @@ with st.expander(
 
 
 # ============================================================
-# MAIN SCAN BUTTON
+# SCAN
 # ============================================================
 
 if st.button(
@@ -1292,7 +1258,7 @@ if st.button(
 ):
 
     # --------------------------------------------------------
-    # GET SYMBOLS
+    # SYMBOLS
     # --------------------------------------------------------
 
     with st.spinner(
@@ -1306,56 +1272,51 @@ if st.button(
         except Exception as e:
 
             st.error(
-                "❌ Binance Spot symbol list load করা যায়নি."
+                "❌ Binance Spot pairs load করা যায়নি."
             )
 
             st.code(
                 str(e)
             )
 
-            st.warning(
-                "উপরের API Connection Test চালিয়ে "
-                "endpoint connectivity check করুন."
-            )
-
             st.stop()
 
     st.success(
-        f"Found {len(symbols)} Spot USDT pairs."
+        f"{len(symbols)} Spot USDT pairs পাওয়া গেছে."
     )
 
     # --------------------------------------------------------
     # SCAN
     # --------------------------------------------------------
 
-    start_time = time.time()
+    start = time.time()
 
     with st.spinner(
-        "Scanning 4H + 1H market structure..."
+        "Scanning 4H + 1H data..."
     ):
 
         results = run_scanner(
             symbols,
             range_limit,
             volume_min_ratio,
-            resistance_distance_limit,
+            resistance_distance,
         )
 
     elapsed = (
-        time.time() - start_time
+        time.time() - start
+    )
+
+    results = normalize_results(
+        results
     )
 
     if results.empty:
 
-        st.error(
-            "No valid market data পাওয়া যায়নি."
+        st.warning(
+            "Valid market data পাওয়া যায়নি."
         )
 
         st.stop()
-
-    results = format_dataframe(
-        results
-    )
 
     # ========================================================
     # SUMMARY
@@ -1376,7 +1337,7 @@ if st.button(
         .sum()
     )
 
-    strong_expansion_count = int(
+    strong_count = int(
         (
             results["Volume Status"]
             == "Strong Expansion"
@@ -1398,7 +1359,7 @@ if st.button(
     c1, c2, c3, c4, c5 = st.columns(5)
 
     c1.metric(
-        "Pairs Scanned",
+        "Pairs",
         len(results),
     )
 
@@ -1408,13 +1369,13 @@ if st.button(
     )
 
     c3.metric(
-        "Volume Expansion",
+        "Expansion",
         expansion_count,
     )
 
     c4.metric(
         "Strong ≥3×",
-        strong_expansion_count,
+        strong_count,
     )
 
     c5.metric(
@@ -1423,12 +1384,12 @@ if st.button(
     )
 
     st.caption(
-        f"Scan completed in {elapsed:.1f} seconds."
+        f"Completed in {elapsed:.1f} seconds."
     )
 
 
     # ========================================================
-    # MAIN HIGHLIGHT
+    # ACCUMULATION + EXPANSION
     # ========================================================
 
     st.markdown(
@@ -1436,46 +1397,39 @@ if st.button(
     )
 
     highlight = results[
-        results["ACC + Expansion"] == True
+        results["ACC + Expansion"]
     ].copy()
+
+    highlight_columns = [
+        "Symbol",
+        "Price",
+        "4H Range %",
+        "4H Vol Ratio",
+        "1H Vol Ratio",
+        "Volume Status",
+        "Resistance Distance %",
+        "Near Resistance",
+        "STRONG Signal",
+    ]
 
     if highlight.empty:
 
         st.info(
-            "এই scan-এ Accumulation + "
+            "কোনো Accumulation + "
             "Volume Expansion পাওয়া যায়নি."
         )
 
     else:
 
-        highlight_columns = [
-            "Symbol",
-            "Price",
-            "4H Range %",
-            "4H Vol Ratio",
-            "1H Vol Ratio",
-            "Volume Status",
-            "Resistance Distance %",
-            "Near Resistance",
-            "STRONG Signal",
-        ]
-
-        highlight = highlight[
-            highlight_columns
-        ]
-
-        st.dataframe(
-            highlight.style.apply(
-                highlight_rows,
-                axis=1,
-            ),
-            use_container_width=True,
-            hide_index=True,
+        show_table(
+            highlight[
+                highlight_columns
+            ]
         )
 
 
     # ========================================================
-    # STRONG SECTION
+    # STRONG
     # ========================================================
 
     st.markdown(
@@ -1483,35 +1437,33 @@ if st.button(
     )
 
     strong = results[
-        results["STRONG Signal"] == True
+        results["STRONG Signal"]
     ].copy()
+
+    strong_columns = [
+        "Symbol",
+        "Price",
+        "4H Range %",
+        "4H Vol Ratio",
+        "1H Vol Ratio",
+        "Volume Status",
+        "Resistance Distance %",
+        "Near Resistance",
+    ]
 
     if strong.empty:
 
         st.info(
-            "Accumulation + Strong Expansion "
-            "≥3× পাওয়া যায়নি."
+            "কোনো Accumulation + "
+            "Strong Expansion ≥3× পাওয়া যায়নি."
         )
 
     else:
 
-        strong_columns = [
-            "Symbol",
-            "Price",
-            "4H Range %",
-            "4H Vol Ratio",
-            "1H Vol Ratio",
-            "Volume Status",
-            "Resistance Distance %",
-            "Near Resistance",
-        ]
-
-        st.dataframe(
+        show_table(
             strong[
                 strong_columns
-            ],
-            use_container_width=True,
-            hide_index=True,
+            ]
         )
 
 
@@ -1523,60 +1475,57 @@ if st.button(
         "## 🎯 Accumulation + Near Resistance"
     )
 
-    near_resistance = results[
+    near = results[
         (
             results["Accumulation"]
-            == True
         )
         &
         (
             results["Near Resistance"]
-            == True
         )
     ].copy()
 
-    if near_resistance.empty:
+    near_columns = [
+        "Symbol",
+        "Price",
+        "4H Range %",
+        "4H Vol Ratio",
+        "1H Vol Ratio",
+        "Volume Status",
+        "Resistance",
+        "Resistance Distance %",
+        "ACC + Expansion",
+    ]
+
+    if near.empty:
 
         st.info(
-            "Accumulation structure-এর মধ্যে "
-            "resistance-এর কাছে কোনো pair পাওয়া যায়নি."
+            "Accumulation + Near Resistance "
+            "pair পাওয়া যায়নি."
         )
 
     else:
 
-        near_columns = [
-            "Symbol",
-            "Price",
-            "4H Range %",
-            "1H Vol Ratio",
-            "Volume Status",
-            "Resistance",
-            "Resistance Distance %",
-            "ACC + Expansion",
-        ]
-
-        st.dataframe(
-            near_resistance[
+        show_table(
+            near[
                 near_columns
-            ],
-            use_container_width=True,
-            hide_index=True,
+            ]
         )
 
 
     # ========================================================
-    # FULL RESULTS
+    # FULL SCAN
     # ========================================================
 
     st.markdown(
-        "## 📋 Full Scan Results"
+        "## 📋 Full Scan"
     )
 
     f1, f2, f3 = st.columns(3)
 
     with f1:
 
-        only_accumulation = st.checkbox(
+        only_acc = st.checkbox(
             "Only Accumulation"
         )
 
@@ -1594,17 +1543,17 @@ if st.button(
 
     display = results.copy()
 
-    if only_accumulation:
+    if only_acc:
 
         display = display[
             display["Accumulation"]
-            == True
         ]
 
     if only_expansion:
 
         display = display[
-            display["Volume Status"].isin(
+            display["Volume Status"]
+            .isin(
                 [
                     "Volume Expansion",
                     "Strong Expansion",
@@ -1616,60 +1565,30 @@ if st.button(
 
         display = display[
             display["Near Resistance"]
-            == True
         ]
 
-    display_columns = [
-        "Symbol",
-        "Price",
-        "Accumulation",
-        "4H Tight Range",
-        "4H Range %",
-        "4H Vol Ratio",
-        "4H Volume Stable",
-        "1H Vol Ratio",
-        "Volume Status",
-        "Resistance",
-        "Resistance Distance %",
-        "Near Resistance",
-        "ACC + Expansion",
-        "STRONG Signal",
-        "Score",
-    ]
-
-    display = display[
-        display_columns
-    ]
-
-    st.dataframe(
-        display.style.apply(
-            highlight_rows,
-            axis=1,
-        ),
-        use_container_width=True,
-        hide_index=True,
+    show_table(
+        display
     )
 
 
     # ========================================================
-    # CSV DOWNLOAD
+    # CSV
     # ========================================================
 
     st.markdown(
-        "## 💾 Export"
+        "## 💾 Download"
     )
 
-    csv_data = results.to_csv(
+    csv = results.to_csv(
         index=False
     ).encode("utf-8")
 
     st.download_button(
-        label="⬇️ Download Full Scan CSV",
-        data=csv_data,
-        file_name=(
-            "binance_usdt_accumulation_scan.csv"
-        ),
-        mime="text/csv",
+        "⬇️ Download Full Scan CSV",
+        csv,
+        "binance_usdt_accumulation_scan.csv",
+        "text/csv",
         use_container_width=True,
     )
 
@@ -1681,38 +1600,33 @@ if st.button(
 else:
 
     st.info(
-        "👆 **SCAN BINANCE USDT PAIRS** "
-        "button চাপলে live scan শুরু হবে."
+        "👆 উপরের **SCAN BINANCE USDT PAIRS** "
+        "button চাপুন."
     )
 
     st.markdown(
         """
-### Scanner Logic
+### Scanner Rules
 
-#### 4H Accumulation
-- Recent 12 × 4H candles-এর range tight কিনা
+**4H**
+- Accumulation structure
+- Tight range
 - Volatility contraction
-- 4H volume stable/increasing
-- Strong downside breakdown নেই
-- Aggressive downtrend নেই
+- Stable/increasing volume
+- Breakdown avoidance
 
-#### 1H Volume
+**1H Volume**
 
 `Current 1H Volume ÷ Previous 10 × 1H Average Volume`
 
 - `< 1.5×` → Normal
-- `≥ 1.5×` → 🟡 **Volume Expansion**
-- `≥ 3.0×` → 🔥 **Strong Expansion**
+- `≥ 1.5×` → 🟡 Volume Expansion
+- `≥ 3×` → 🔥 Strong Expansion
 
-#### Highlight
+**Highlights**
 
-- 🟡 **Accumulation + Volume Expansion**
-- 🔥 **Accumulation + Strong Expansion ≥3×**
+- 🟡 Accumulation + Volume Expansion
+- 🔥 Accumulation + Strong Expansion
 - 🎯 Accumulation + Near Resistance
-
-### Important
-
-এটি একটি market-screening tool।  
-`Accumulation` এবং `Resistance` এখানে rule-based/heuristic detection—এগুলো guaranteed trading signal নয়।
 """
     )
