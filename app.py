@@ -65,4 +65,4 @@ with col1:
 with col2:
     st.link_button("🔗 CryptoRank AI Screener", "https://cryptorank.io")
 with col3:
-    st.link_button("🔗 Live Token Unlocks 
+    st.link_button("🔗 Live Token Unlocks Schedule", "https://unlocks.app")
